@@ -33,3 +33,7 @@ Board's WiFi IP is now logged on connect (previously never printed)
 ## Disabling the Cloud Connection
 
 With this solution in place, you can disable the oven's Wi-Fi connection entirely. If you prefer to block the connection at your router instead, note that the oven tries to reach the hostname *m.maestro.mcz.it*.
+
+The ESP can be powered directly from the motherboard's USB port.
+<img width="961" height="899" alt="IMG_6411" src="https://github.com/user-attachments/assets/bf8e8dd3-f099-4723-a655-501891867545" />
+
