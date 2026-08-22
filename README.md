@@ -6,3 +6,6 @@ Home Assistant integration is included — all entities are discovered automatic
 
 
 Generic ESP32-C3 (Bluetooth ↔ Wi-Fi bridge)
+
+ADD telnet port 23 
+cmd "settime" force ntp-->Pelletstove
