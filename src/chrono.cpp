@@ -4,6 +4,8 @@
 #include "chrono.h"
 #include <Arduino.h>
 #include "ble_api.h"
+#include "net_telnet.h"
+#define Serial g_telnetSerial   // mirror this file's logs to the WiFi Telnet console too
 
 static const uint16_t REG_TEMP_ECO     = 0x097C;   // 2428
 static const uint16_t REG_TEMP_COMFORT = 0x097D;   // 2429

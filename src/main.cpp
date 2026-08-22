@@ -29,6 +29,11 @@
 #include "appconfig.h"
 #include "ble_api.h"
 #include "chrono.h"
+#include "net_telnet.h"
+// From here on, every Serial.print/println/printf/available/read call in this file is
+// mirrored to a WiFi Telnet console (port 23) as well as the real USB UART -> the board
+// can be monitored/controlled over WiFi too, with zero changes to the calls below.
+#define Serial g_telnetSerial
 #if defined(__has_include)
 #  if __has_include("config.h")
 #    include "config.h"
@@ -124,8 +129,10 @@ static void writeFrame(const uint8_t *pdu, size_t pduLen) {
   g_abf1->writeValue(ct, n, false);   // WriteNoResponse
 }
 
+static uint16_t g_lastReadCount = 0;    // registers requested for g_lastReadBase (mismatch -> stale response)
 static void sendRead(uint16_t reg, uint16_t count) {
   g_lastReadBase = reg;   // response (function 03) carries no address -> remember base here
+  g_lastReadCount = count;
   uint8_t pdu[6]={0x01,0x03,(uint8_t)(reg>>8),(uint8_t)reg,(uint8_t)(count>>8),(uint8_t)count};
   Serial.printf("Modbus READ  reg=0x%04X count=%u\n", reg, count); writeFrame(pdu,6);
 }
@@ -158,6 +165,23 @@ bool bleReadRegs(uint16_t reg, uint16_t count, uint16_t* dst){
 
 // ---- Register -> OvenState (source irrelevant: poll read or ##-broadcast) ---
 static void bumpSeq(){ g_oven.seq++; g_oven.lastUpdateMs = millis(); }
+
+// 32-bit minute counters (work time, time-per-power-level) are assembled from two separate
+// 16-bit register reads (low word, then high word). A corrupted/torn BLE read can pair the
+// wrong low/high word together and produce a wildly wrong value (seen as tens of millions of
+// minutes). These counters can only legitimately increase, and only slowly (at most a few
+// minutes between polls) -> reject decreases and implausible jumps instead of forwarding
+// garbage to Home Assistant, where it breaks "total_increasing" sensors/statistics.
+static const int32_t COUNTER_MAX_JUMP_MIN = 1440;  // 24h: generous upper bound per update
+static bool acceptCounter(int32_t &cur, int32_t neu){
+  if (neu < 0) return false;                          // never negative
+  if (cur < 0){ cur = neu; return true; }              // first valid value, accept as-is
+  if (neu == cur) return false;                        // no change
+  if (neu < cur) return false;                         // counters never decrease -> torn read
+  if ((neu - cur) > COUNTER_MAX_JUMP_MIN) return false; // implausible jump -> torn read
+  cur = neu; return true;
+}
+
 void ovenApplyReg(uint16_t reg, uint16_t val){
   static uint16_t workLo = 0;        // low word of the 32-bit work time (persists between calls)
   // Time in power level 1..5 (0x0336..0x033F): 5x 32-bit seconds, low word first -> minutes
@@ -167,7 +191,7 @@ void ovenApplyReg(uint16_t reg, uint16_t val){
     if ((reg & 1) == 0){ ptLo[idx] = val; }       // even address = low word
     else {                                        // odd = high word -> minutes
       int32_t m = (int32_t)((((uint32_t)val<<16) | ptLo[idx]) / 60);
-      if (g_oven.powerTimeMin[idx] != m){ g_oven.powerTimeMin[idx] = m; bumpSeq(); }
+      if (acceptCounter(g_oven.powerTimeMin[idx], m)) bumpSeq();
     }
     return;
   }
@@ -234,7 +258,7 @@ void ovenApplyReg(uint16_t reg, uint16_t val){
     case REG_FAN_LIVE: if(g_oven.fanLevel!=(int8_t)val){g_oven.fanLevel=(int8_t)val;bumpSeq();} break;
     case REG_WORK_LO:  workLo = val; break;                          // remember low; minutes at HI
     case REG_WORK_HI:  { int32_t m=(int32_t)((((uint32_t)val<<16)|workLo)/60);
-                         if(g_oven.worktimeMin!=m){g_oven.worktimeMin=m;bumpSeq();} } break;
+                         if(acceptCounter(g_oven.worktimeMin, m)) bumpSeq(); } break;
     default: break;
   }
 }
@@ -313,6 +337,24 @@ bool ovenSetClock(){
   sendWriteMulti(REG_DT_DAYMON, vals, 5);
   Serial.printf(">> Clock set via NTP (Fn16): %04d-%02d-%02d %02d:%02d:%02d (weekday %d, 0=Mon)\n",
                 year, mon, day, hh, mm, ss, wd);
+  // Fn 0x10 gives no write echo (unlike Fn 0x06) -> we cannot just assume it was applied.
+  // Read the date/time registers back and compare, so a silently-rejected/failed write is
+  // detected and retried soon, instead of believing it worked and waiting 24h for the next try.
+  delay(300);                                    // let the module commit before reading back
+  uint16_t rb[4];
+  if(!bleReadRegs(REG_DT_DAYMON, 4, rb)){
+    Serial.println("!! clock: read-back failed (no response) - write not confirmed, will retry soon");
+    return false;
+  }
+  int rMon=rb[0]>>8, rDay=rb[0]&0xFF, rYear=(int)rb[1], rHr=rb[2]&0xFF, rMin=rb[2]>>8;
+  bool dateOk = (rMon==mon && rDay==day && rYear==year);
+  bool timeOk = (rHr==hh) && (abs(rMin-mm)<=1);   // tolerate a minute tick during the round-trip
+  if(!dateOk || !timeOk){
+    Serial.printf("!! clock: read-back mismatch, oven shows %04d-%02d-%02d %02d:%02d - write NOT applied, will retry soon\n",
+                  rYear, rMon, rDay, rHr, rMin);
+    return false;
+  }
+  Serial.println(">> Clock confirmed via read-back.");
   return true;
 }
 
@@ -436,6 +478,16 @@ static void notifyCB(NimBLERemoteCharacteristic*, uint8_t *data, size_t len, boo
   // Function 03 response: [01][03][bytecount][data...][crc]
   if (mbLen>=5 && mb[1]==0x03) {
     uint8_t bc = mb[2];
+    // Guard against a stale/late response being mis-paired with a NEWER request: g_lastReadBase
+    // is a single global set by sendRead() and assumes exactly one read is ever in flight. If a
+    // response arrives after the next read was already sent, applying it under the new base would
+    // scramble unrelated registers (seen as wild mode/power/setpoint/counter garbage). The
+    // register count in the response must match what was actually requested.
+    if (bc/2 != g_lastReadCount){
+      Serial.printf("[abf2] fn03: got %u regs, expected %u for base 0x%04X -> stale/mismatched response, discarded\n",
+                    bc/2, g_lastReadCount, g_lastReadBase);
+      return;
+    }
     if (g_logRaw) Serial.printf("       %u data bytes (%u registers 16bit): ", bc, bc/2);
     for (uint8_t i=0;i+1<bc;i+=2) {
       uint16_t r = (mb[3+i]<<8)|mb[3+i+1];
@@ -756,14 +808,18 @@ static void displayTick(){
 }
 // Auto-sync the oven RTC from NTP: once shortly after connect+NTP is ready, then daily.
 static void clockTick(){
-  static uint32_t lastSet=0; static bool done=false;
+  static uint32_t lastAttempt=0; static bool done=false;
   if(!g_connected || !g_abf1 || !g_caps.detected) return;   // after capability scan settles
   uint32_t now=millis();
-  if(done && (now-lastSet) < 24UL*60*60*1000) return;       // re-sync every 24h (RTC drifts)
+  // Confirmed OK -> daily resync (RTC drift). Not yet confirmed -> retry every 60s instead of
+  // silently waiting 24h (see ovenSetClock: Fn 0x10 write is now verified via read-back).
+  uint32_t interval = done ? (24UL*60*60*1000) : 60000UL;
+  if(now-lastAttempt < interval) return;
   struct tm t;
   if(!getLocalTime(&t, 5)) return;                          // NTP not synced yet -> retry later
   if(t.tm_year+1900 < 2024) return;
-  if(ovenSetClock()){ lastSet=now; done=true; }
+  lastAttempt = now;
+  done = ovenSetClock();
 }
 // Periodic diagnostic so instability (heap leak / WiFi drop / reboot) is visible in the log.
 static void heartbeat(){
@@ -774,6 +830,7 @@ static void heartbeat(){
     g_connected?1:0, netWifiUp()?1:0, netMqttUp()?1:0);
 }
 void loop(){
+  g_telnetSerial.tick();     // accept/maintain the WiFi Telnet console client
   static String line;
   while(Serial.available()){ char c=(char)Serial.read();
     if(c=='\n'||c=='\r'){ if(line.length()){handleLine(line);line="";} } else line+=c; }

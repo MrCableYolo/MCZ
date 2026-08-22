@@ -12,6 +12,8 @@
 #include "config.h"
 #include "appconfig.h"
 #include "oven.h"
+#include "net_telnet.h"
+#define Serial g_telnetSerial   // mirror this file's logs to the WiFi Telnet console too
 
 static WiFiClient   wifiClient;
 static PubSubClient mqtt(wifiClient);
@@ -138,7 +140,12 @@ static void publishDiscovery(){
     pm.add("Comfort"); pm.add("Overnight"); pm.add("Turbo"); pm.add("Auto"); pm.add("Manual");
     d["preset_mode_command_topic"]  = T_SET_MODE;
     d["preset_mode_state_topic"]    = T_STATE;
-    d["preset_mode_value_template"] = "{{ value_json.mode_name }}";
+    // mode_name can be "?" (raw register value outside the known 0..4 enum, e.g. stale data
+    // while Off/disconnected) -> only forward it if it's one of the declared preset_modes,
+    // else '' (unknown), instead of forwarding "?" (HA would otherwise log "not a valid preset mode").
+    d["preset_mode_value_template"] =
+      "{% set v = value_json.mode_name %}"
+      "{{ v if v in ['Comfort','Overnight','Turbo','Auto','Manual'] else '' }}";
     addDevice(d.as<JsonObject>());
     publishJson(discoTopic("climate", "climate"), d, true);
   }
@@ -149,7 +156,10 @@ static void publishDiscovery(){
     d["availability_topic"] = T_AVAIL;
     d["command_topic"] = T_SET_POWER;
     d["state_topic"]   = T_STATE;
-    d["value_template"]= "{{ value_json.power }}";
+    // Register can report values outside 1..5 (e.g. stale/garbage while the stove is Off /
+    // BLE not connected) -> map anything outside range to '' (unknown) instead of forwarding
+    // an invalid value (HA would otherwise log "Invalid value ... range 1.0 - 5.0" repeatedly).
+    d["value_template"]= "{% set v = value_json.power | int(-1) %}{{ v if (v >= 1 and v <= 5) else '' }}";
     d["min"] = 1; d["max"] = 5; d["step"] = 1; d["mode"] = "slider";
     addDevice(d.as<JsonObject>());
     publishJson(discoTopic("number", "power"), d, true);
@@ -183,7 +193,9 @@ static void publishDiscovery(){
     d["availability_topic"] = T_AVAIL;
     d["command_topic"] = T_SET_SILENT;
     d["state_topic"]   = T_STATE;
-    d["value_template"]= "{{ 'ON' if value_json.silent else 'OFF' }}";
+    // 'silent' key can be absent from the payload while flags is unknown (e.g. stove Off) ->
+    // default(false) avoids the "'dict object' has no attribute 'silent'" template warning.
+    d["value_template"]= "{{ 'ON' if value_json.silent | default(false) else 'OFF' }}";
     d["payload_on"]  = "on"; d["payload_off"] = "off";
     d["state_on"]    = "ON"; d["state_off"]   = "OFF";
     d["icon"]        = "mdi:volume-off";
@@ -376,10 +388,17 @@ void netBegin(){
 
 void netTick(){
   static uint32_t lastWifi=0, lastMqtt=0;
+  static bool wifiWasUp=false;
   uint32_t now = millis();
   if (WiFi.status() != WL_CONNECTED){
+    wifiWasUp = false;
     if (now - lastWifi > 5000){ lastWifi = now; WiFi.reconnect(); }
     return;
+  }
+  if (!wifiWasUp){    // log once per (re)connect, independent of the oven/BLE state
+    wifiWasUp = true;
+    Serial.printf(">> WiFi connected, IP=%s (telnet to it, port 23, for the console)\n",
+                  WiFi.localIP().toString().c_str());
   }
   if (!g_idReady){                    // wait for identity (oven MAC)
     if (buildIdentity()){ g_idReady = true; Serial.printf(">> MQTT ID: %s\n", g_id.c_str()); }

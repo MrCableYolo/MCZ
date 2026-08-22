@@ -2,6 +2,8 @@
 #include "appconfig.h"
 #include <Preferences.h>
 #include "config.h"      // Default/first-boot values
+#include "net_telnet.h"
+#define Serial g_telnetSerial   // mirror this file's logs to the WiFi Telnet console too
 
 #ifndef TARGET_MAC
 #  define TARGET_MAC ""
