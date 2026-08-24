@@ -33,6 +33,34 @@ Board's WiFi IP is now logged on connect (previously never printed)
 ## Disabling the Cloud Connection
 
 With this solution in place, you can disable the oven's Wi-Fi connection entirely. If you prefer to block the connection at your router instead, note that the oven tries to reach the hostname *m.maestro.mcz.it*.
+## Telnet 
+
+List of available serial/telnet commands (from `handleLine` in `main.cpp`):
+
+| Command | Description |
+|---|---|
+| `help` | Shows the list of commands |
+| `status` | Displays the current oven status |
+| `poll` | Forces a read of register 0x02BC (33 values) |
+| `on` / `off` | Turns the oven on / off |
+| `temp <c>` | Sets target temperature (°C) |
+| `power <1-5>` | Sets power level |
+| `mode <0-4>` | Sets mode (0=Manual, 1=Auto, 2=Overnight, 3=Comfort, 4=Turbo) |
+| `fan <auto\|1-5>` | Sets fan speed |
+| `silent on` / `silent off` | Enables/disables silent mode |
+| `settime` | Sends current time (NTP) to the oven |
+| `getchrono` | Reads and displays chrono/scheduling registers |
+| `alarms` | Shows alarm history |
+| `log on` / `log off` | Enables/disables raw frame logging |
+| `scan` | Scans ~8s for nearby MCZ_EP ovens over BLE |
+| `target <mac\|none>` | Sets (or clears) the targeted MAC address, then restarts |
+| `target` (alone) | Shows the currently configured target |
+| `r <regHex> <count>` | Raw Modbus register read |
+| `w <regHex> <valHex>` | Raw Modbus register write |
+| `wm <regHex> <v0> <v1>...` | Multi-register Modbus write (function 0x10) |
+| `ctr <hex>` | Manually sets the frame counter |
+
+##
 
 The ESP can be powered directly from the motherboard's USB port.
 <img width="961" height="899" alt="IMG_6411" src="https://github.com/user-attachments/assets/bf8e8dd3-f099-4723-a655-501891867545" />
