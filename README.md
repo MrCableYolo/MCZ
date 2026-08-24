@@ -1,5 +1,5 @@
-!!!!It's a fork from https://github.com/foyewmaddeeb/mcz-maestro-ble!!!!
-
+It's a fork from https://github.com/foyewmaddeeb/mcz-maestro-ble
+##
 
 The goal of this project is to provide local access to your oven without relying on the MCZ cloud. 
 Home Assistant integration is included — all entities are discovered automatically, so no separate integration is required.
@@ -23,7 +23,7 @@ Root-cause fix for stale BLE responses: Modbus read responses are now validated 
 The oven clock write (Modbus Fn 0x10) previously had no confirmation — it was assumed successful as soon as sent
 Added a read-back verification right after writing: compares the oven's actual date/time against what was sent
 On mismatch/failure: retries every 60 seconds instead of waiting 24 hours; logs a clear success/failure message
-5. WiFi Telnet Console (new feature)
+5. WiFi Telnet Console
 New net_telnet.h/.cpp: a TelnetSerial class that mirrors all Serial output/input to a WiFi Telnet client (port 23), in addition to USB
 Applied via a scoped #define Serial g_telnetSerial in main.cpp, net_mqtt.cpp, chrono.cpp, appconfig.cpp — no changes needed to existing Serial.print/printf calls
 One client at a time; second connection attempts are rejected
