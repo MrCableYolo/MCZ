@@ -28,6 +28,10 @@ New net_telnet.h/.cpp: a TelnetSerial class that mirrors all Serial output/input
 Applied via a scoped #define Serial g_telnetSerial in main.cpp, net_mqtt.cpp, chrono.cpp, appconfig.cpp — no changes needed to existing Serial.print/printf calls
 One client at a time; second connection attempts are rejected
 Board's WiFi IP is now logged on connect (previously never printed)
+6. Discovery HA "device-based"
+A single `homeassistant/device/<mac>/config` message instead of ~20.
+7. worktime/time_power_x in Hour
+Fixes an issue in Home Assistant where values ​​were in minutes.
 
 
 ## Disabling the Cloud Connection
@@ -59,6 +63,8 @@ List of available serial/telnet commands (from `handleLine` in `main.cpp`):
 | `w <regHex> <valHex>` | Raw Modbus register write |
 | `wm <regHex> <v0> <v1>...` | Multi-register Modbus write (function 0x10) |
 | `ctr <hex>` | Manually sets the frame counter |
+| `pause/resume` | Freezes only the output to the Telnet client, using a 4 KB buffer to avoid data loss during the pause (flushed upon resuming). |
+| `regs, regs known, regs unknown` | Each register read (poll or broadcast) is stored in a 300-entry table. `regs`, `regs known`, and `regs unknown` display address/value/age, with an `<-- unmapped` marker for anything not yet decoded. |
 
 ##
 
