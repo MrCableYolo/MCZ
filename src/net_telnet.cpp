@@ -1,6 +1,7 @@
 // net_telnet.cpp — see net_telnet.h. Deliberately does NOT #define Serial: every
 // unqualified "Serial" below refers to the real hardware UART.
 #include "net_telnet.h"
+#include <string.h>   // memcpy
 
 void TelnetSerial::begin(unsigned long baud){
   Serial.begin(baud);            // real UART, unchanged behaviour
@@ -26,13 +27,30 @@ void TelnetSerial::tick(){
 
 size_t TelnetSerial::write(uint8_t b){
   Serial.write(b);
-  if (client && client.connected()) client.write(b);
+  if (paused_){
+    if (pauseLen_ < PAUSE_BUF_SIZE) pauseBuf_[pauseLen_++] = b;
+    else pauseDropped_++;                       // buffer full: count what we couldn't keep
+  } else if (client && client.connected()) client.write(b);
   return 1;
 }
 size_t TelnetSerial::write(const uint8_t *buf, size_t size){
   Serial.write(buf, size);
-  if (client && client.connected()) client.write(buf, size);
+  if (paused_){
+    size_t room = (PAUSE_BUF_SIZE > pauseLen_) ? (PAUSE_BUF_SIZE - pauseLen_) : 0;
+    size_t take = size < room ? size : room;
+    if (take){ memcpy(pauseBuf_ + pauseLen_, buf, take); pauseLen_ += take; }
+    if (take < size) pauseDropped_ += (size - take);
+  } else if (client && client.connected()) client.write(buf, size);
   return size;
+}
+
+void TelnetSerial::pauseOutput(){
+  paused_ = true; pauseLen_ = 0; pauseDropped_ = 0;
+}
+void TelnetSerial::resumeOutput(){
+  paused_ = false;
+  if (client && client.connected() && pauseLen_) client.write(pauseBuf_, pauseLen_);
+  pauseLen_ = 0;
 }
 int TelnetSerial::available(){
   int n = Serial.available();

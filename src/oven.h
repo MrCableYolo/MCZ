@@ -31,9 +31,9 @@ static const uint16_t REG_ALARM    = 0x0323;  // tipo_allarme = LOW byte (0 = no
 static const uint16_t REG_ALARM_IDX= 0x07EA;  // index_allarme (hi) / num_allarmi (lo) — alarm log head
 static const uint16_t REG_FLAGS    = 0x0332;  // Bit field: Bit6=Chrono, Bit5=Silent
 static const uint16_t REG_IGNIT    = 0x0334;  // Ignition counter
-static const uint16_t REG_WORK_LO  = 0x0340;  // Total working time (sec, 32-bit LE word)
+static const uint16_t REG_WORK_LO  = 0x0340;  // Total working time (hours, 32-bit LE word)
 static const uint16_t REG_WORK_HI  = 0x0341;
-static const uint16_t REG_PTIME_LO = 0x0336;  // Time in power 1..5: 5x 32-bit (sec),
+static const uint16_t REG_PTIME_LO = 0x0336;  // Time in power 1..5: 5x 32-bit (hours),
 static const uint16_t REG_PTIME_HI = 0x033F;  // low word first, 0x0336..0x033F
 static const uint16_t REG_ACTIVE   = 0x02C9;  // App value "active" 
 static const uint16_t REG_FAN_COMB = 0x02CE;  // Combustion fan RPM
@@ -82,6 +82,35 @@ extern OvenCaps g_caps;
 static const float TEMP_MIN_C = 5.0f, TEMP_MAX_C = 45.0f;  // Plausibility limits for setpoint
 
 // ---- Running oven state ----------------------------------------------------
+struct OvenState;  // fwd decl (pointer-to-member below needs the type name only)
+
+// ---- Generic plausibility filter for every °C-scaled (raw/10) register -----
+// A torn/corrupted BLE notification can hand back a garbage raw value for ANY
+// register, not just the setpoint (that's what produced the 6295.5C spike seen
+// in Home Assistant). Rather than hand-write a "min/max" check inside every
+// switch-case (easy to forget for the next sensor), every scaled-temperature
+// register is declared ONCE here with its plausible range, and a single
+// generic function (ovenApplyScaledTemp, in main.cpp) enforces it for all of
+// them. Discovering a new register in the future = add one line to this table;
+// it is automatically bounds-checked, no other code to touch.
+struct ScaledTempField {
+  uint16_t reg;              // Modbus register address
+  float OvenState::*field;   // OvenState member this register feeds
+  float   minC, maxC;        // plausibility bounds (inclusive) — raw/10 must fall in here
+  bool    sentinelIsNan;     // true: raw 0xFFFF means "feature not configured" -> NAN (no bound check)
+  const char* name;          // short id for diagnostic logging
+};
+extern const ScaledTempField SCALED_TEMP_FIELDS[];
+extern const size_t SCALED_TEMP_FIELD_COUNT;
+
+// Try to apply `val` (raw register content) to one of the table entries above.
+// Returns false if `reg` isn't a known scaled-temp register (caller should fall
+// through to its own switch/case for non-temperature registers).
+// Returns true if `reg` was recognized: `changed` is then set to true only if
+// the value was both plausible AND actually different from the stored one.
+// Implausible values are logged and discarded (g_oven.* keeps its last good value).
+bool ovenApplyScaledTemp(uint16_t reg, uint16_t val, bool &changed);
+
 struct OvenState {
   float    roomC      = NAN;   // Room temperature
   float    boilerC    = NAN;   // Boiler water temperature (Hydro, 0x02BF)
@@ -101,8 +130,8 @@ struct OvenState {
   int32_t  state      = -1;    // Fine phase 0x0320 (code, see stateName)
   int16_t  flags      = -1;    // Bit field 0x0332
   int32_t  ignitions  = -1;    // Ignitions
-  int32_t  worktimeMin= -1;    // Total working time in minutes
-  int32_t  powerTimeMin[5] = {-1,-1,-1,-1,-1};  // Time in power 1..5 (minutes)
+  int32_t  worktimeMinutes = -1;    // Total working time in minutes (32-bit register value)
+  int32_t  powerTimeMinutes[5] = {-1,-1,-1,-1,-1};  // Time in power 1..5 (minutes)
   int32_t  fanComb    = -1;    // Combustion fan RPM
   int32_t  fanRoom    = -1;    // Flue gas fan RPM
   int32_t  active     = -1;    // App value "active" (0x02C9)

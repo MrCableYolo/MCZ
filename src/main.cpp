@@ -23,6 +23,7 @@
 #include <NimBLEDevice.h>
 #include "mbedtls/aes.h"
 #include <time.h>          // NTP time for the oven clock (getLocalTime/configTzTime)
+#include <esp_task_wdt.h>  // hardware watchdog: auto-reboot if loop() ever gets stuck
 #include "oven.h"
 #include "net_mqtt.h"
 #include "display.h"
@@ -81,8 +82,57 @@ static volatile bool g_rawCapture = false;
 static uint16_t      g_rawBase = 0;
 static uint16_t*     g_rawDst = nullptr;
 static volatile int  g_rawGot = -1;
-static bool     g_logRaw = true;        // verbose Modbus dumps (quieter via 'log off')
+static bool     g_logRaw = false;       // verbose Modbus dumps (noisy -> off by default, 'log on' to enable)
 static const uint32_t POLL_INTERVAL_MS = 2500;  // auto-poll rate per status block
+
+// ---- Register tracker (diagnostic aid for reverse-engineering new registers) -----------
+// Every register value that flows through ovenApplyReg (poll reads AND ##-broadcasts) is
+// recorded here, whether or not it's currently mapped to something in OvenState. The 'regs'
+// serial/telnet command dumps this table so you can spot registers the firmware reads but
+// does not yet decode (e.g. inside the big 0x02BC/0x0320/0x03E9 poll blocks) and add them to
+// oven.h / the switch in ovenApplyReg later, without needing a logic analyzer or app decompile.
+struct RegSnap { uint16_t reg; uint16_t val; uint32_t ms; };
+static const int REG_TABLE_MAX = 300;
+static RegSnap   g_regTable[REG_TABLE_MAX];
+static int       g_regTableCount = 0;
+static void regTrack(uint16_t reg, uint16_t val){
+  for(int i=0;i<g_regTableCount;i++) if(g_regTable[i].reg==reg){ g_regTable[i].val=val; g_regTable[i].ms=millis(); return; }
+  if(g_regTableCount<REG_TABLE_MAX) g_regTable[g_regTableCount++] = { reg, val, millis() };
+}
+// Is `reg` already decoded into something meaningful (OvenState field / capability / etc.)?
+// Kept as its own small classifier (rather than instrumenting every return in ovenApplyReg)
+// so it's easy to extend the moment you identify a new register: just add it to the list.
+static bool isKnownReg(uint16_t reg){
+  if (reg >= REG_PTIME_LO && reg <= REG_PTIME_HI) return true;                    // power-time block
+  if (reg >= 0x07EE && reg <= 0x097A && ((reg-0x07EE)%4)==0) return true;         // alarm log codes
+  if (reg >= REG_BANCADATI && reg <= 0x07CE) return true;                        // model db name
+  for (size_t i=0;i<SCALED_TEMP_FIELD_COUNT;i++) if (SCALED_TEMP_FIELDS[i].reg==reg) return true;
+  static const uint16_t KNOWN[] = {
+    REG_POWER, REG_MODE, REG_MODE_LIVE, REG_ONOFF, REG_STATE, REG_PHASE, REG_ALARM, REG_ALARM_IDX,
+    REG_FLAGS, REG_IGNIT, REG_ACTIVE, REG_FAN_COMB, REG_FAN_ROOM, REG_FAN_LIVE, REG_FAN_SET,
+    REG_WORK_LO, REG_WORK_HI, REG_TIPO_APP, REG_CLIMA, REG_ABI_VEN12, REG_ABI_VEN34,
+    REG_VVEN1_LO, 0x05FE, REG_VVEN1_HI, REG_SET_BOILER, REG_MAXPOT_IDRO, REG_SILENT,
+    REG_DT_DAYMON, REG_DT_YEAR, REG_DT_HRMIN, REG_DT_SECWD, REG_DT_TRIGGER,
+  };
+  for (size_t i=0;i<sizeof(KNOWN)/sizeof(KNOWN[0]);i++) if (KNOWN[i]==reg) return true;
+  return false;
+}
+// Print the tracked register table. filter: 0=all, 1=known only, 2=unknown only.
+static void printRegTable(int filter){
+  int shown=0, unk=0;
+  Serial.printf("---- Register snapshot (%d tracked) ----\n", g_regTableCount);
+  for(int i=0;i<g_regTableCount;i++){
+    bool known = isKnownReg(g_regTable[i].reg);
+    if(!known) unk++;
+    if(filter==1 && !known) continue;
+    if(filter==2 && known)  continue;
+    Serial.printf("  0x%04X = %5u (0x%04X)  age=%2lus  %s\n",
+      g_regTable[i].reg, g_regTable[i].val, g_regTable[i].val,
+      (unsigned long)((millis()-g_regTable[i].ms)/1000), known?"":"  <-- unmapped, candidate to decode");
+    shown++;
+  }
+  Serial.printf("---- %d shown, %d unmapped total (of %d tracked) ----\n", shown, unk, g_regTableCount);
+}
 
 // ---- Modbus CRC16 ----------------------------------------------------------
 static uint16_t modbusCRC(const uint8_t *d, size_t n) {
@@ -166,32 +216,79 @@ bool bleReadRegs(uint16_t reg, uint16_t count, uint16_t* dst){
 // ---- Register -> OvenState (source irrelevant: poll read or ##-broadcast) ---
 static void bumpSeq(){ g_oven.seq++; g_oven.lastUpdateMs = millis(); }
 
-// 32-bit minute counters (work time, time-per-power-level) are assembled from two separate
-// 16-bit register reads (low word, then high word). A corrupted/torn BLE read can pair the
-// wrong low/high word together and produce a wildly wrong value (seen as tens of millions of
-// minutes). These counters can only legitimately increase, and only slowly (at most a few
-// minutes between polls) -> reject decreases and implausible jumps instead of forwarding
-// garbage to Home Assistant, where it breaks "total_increasing" sensors/statistics.
-static const int32_t COUNTER_MAX_JUMP_MIN = 1440;  // 24h: generous upper bound per update
+// ---- Generic plausibility filter for every °C-scaled register (see oven.h) --
+// ONE table, ONE bound check, used for every current AND future temperature-like
+// register: a corrupted/torn BLE read can produce a garbage raw value for any of
+// them (that's what caused the 6295.5C setpoint spike), so every entry gets the
+// same protection instead of relying on a hand-written check per register.
+const ScaledTempField SCALED_TEMP_FIELDS[] = {
+  { REG_ROOM,         &OvenState::roomC,      -10.0f,  50.0f, false, "room"         },
+  { REG_BOILER_T,     &OvenState::boilerC,      0.0f, 110.0f, false, "boiler"       },
+  { REG_PUFFER_T,     &OvenState::pufferC,      0.0f, 110.0f, false, "puffer"       },
+  { REG_BOARD,        &OvenState::boardC,     -20.0f, 100.0f, false, "board"        },
+  { REG_FUMES,        &OvenState::fumesC,       0.0f, 400.0f, false, "fumes"        },
+  { REG_SETPOINT,     &OvenState::setpointC,  TEMP_MIN_C, TEMP_MAX_C, false, "setpoint" },
+  { REG_HYST_AMB_NEG, &OvenState::hystAmbNeg,   0.0f,  15.0f, false, "hyst_amb_neg" },
+  { REG_HYST_AMB_POS, &OvenState::hystAmbPos,   0.0f,  15.0f, false, "hyst_amb_pos" },
+  { REG_HYST_SS_NEG,  &OvenState::hystSSNeg,    0.0f,  30.0f, false, "hyst_ss_neg"  },
+  { REG_HYST_SS_POS,  &OvenState::hystSSPos,    0.0f,  30.0f, false, "hyst_ss_pos"  },
+  { REG_PUMP_MIN_ON,  &OvenState::pumpMinOn,    0.0f, 100.0f, false, "pump_min_on"  },
+  { REG_SET_PUFFER,   &OvenState::pufferSet,    0.0f, 110.0f, true,  "puffer_set"   },
+};
+const size_t SCALED_TEMP_FIELD_COUNT = sizeof(SCALED_TEMP_FIELDS)/sizeof(SCALED_TEMP_FIELDS[0]);
+
+bool ovenApplyScaledTemp(uint16_t reg, uint16_t val, bool &changed){
+  changed = false;
+  for (size_t i=0; i<SCALED_TEMP_FIELD_COUNT; i++){
+    const ScaledTempField &f = SCALED_TEMP_FIELDS[i];
+    if (f.reg != reg) continue;                       // not this one, keep looking
+
+    float c;
+    if (f.sentinelIsNan && val == SENTINEL16){
+      c = NAN;                                         // "feature not configured", not a fault
+    } else {
+      c = val / 10.0f;
+      if (c < f.minC || c > f.maxC){
+        // Corrupted/torn BLE read -> discard, keep last good value. Logged so a
+        // real out-of-range fault is still visible, just never forwarded to HA.
+        Serial.printf("!! Discarded implausible %s reading: %.1f C (raw=0x%04X, valid %.1f..%.1f)\n",
+                      f.name, c, val, f.minC, f.maxC);
+        return true;                                   // reg recognized, but rejected
+      }
+    }
+    float &cur = g_oven.*f.field;
+    if (cur != c && !(isnan(cur) && isnan(c))){ cur = c; changed = true; }
+    return true;                                        // reg recognized and applied
+  }
+  return false;                                          // not a scaled-temp register
+}
+
+// 32-bit hour counters (work time, time-per-power-level) are assembled from two separate
+// 16-bit register reads (low word, then high word). The oven exposes these counters directly
+// in hours. A corrupted/torn BLE read can pair the wrong low/high word together and produce a
+// wildly wrong value, so reject decreases and implausibly large jumps before publishing to
+// Home Assistant, where these sensors are total_increasing.
+static const int32_t COUNTER_MAX_JUMP_MINUTES = 24*60;  // generous upper bound per update
 static bool acceptCounter(int32_t &cur, int32_t neu){
   if (neu < 0) return false;                          // never negative
   if (cur < 0){ cur = neu; return true; }              // first valid value, accept as-is
   if (neu == cur) return false;                        // no change
   if (neu < cur) return false;                         // counters never decrease -> torn read
-  if ((neu - cur) > COUNTER_MAX_JUMP_MIN) return false; // implausible jump -> torn read
+  if ((neu - cur) > COUNTER_MAX_JUMP_MINUTES) return false; // implausible jump -> torn read
   cur = neu; return true;
 }
 
 void ovenApplyReg(uint16_t reg, uint16_t val){
+  regTrack(reg, val);                // diagnostic: remember every register seen, see 'regs' command
   static uint16_t workLo = 0;        // low word of the 32-bit work time (persists between calls)
-  // Time in power level 1..5 (0x0336..0x033F): 5x 32-bit seconds, low word first -> minutes
+  // Time in power level 1..5 (0x0336..0x033F): 5x 32-bit minute counters, low word first
   if (reg >= REG_PTIME_LO && reg <= REG_PTIME_HI){
     static uint16_t ptLo[5] = {0};
     int idx = (reg - REG_PTIME_LO) / 2;          // 0..4
     if ((reg & 1) == 0){ ptLo[idx] = val; }       // even address = low word
     else {                                        // odd = high word -> minutes
-      int32_t m = (int32_t)((((uint32_t)val<<16) | ptLo[idx]) / 60);
-      if (acceptCounter(g_oven.powerTimeMin[idx], m)) bumpSeq();
+      int32_t m = (int32_t)(((uint32_t)val<<16) | ptLo[idx]);
+      if (acceptCounter(g_oven.powerTimeMinutes[idx], m)) bumpSeq();
     }
     return;
   }
@@ -207,13 +304,22 @@ void ovenApplyReg(uint16_t reg, uint16_t val){
     if (b>=32 && b<127) g_caps.bancaDati += b;
     return;
   }
+  // Every °C-scaled register (room/boiler/puffer/board/fumes/setpoint/hysteresis/...)
+  // goes through the single generic plausibility filter first (see oven.h for why:
+  // this is what rejects a torn/corrupted BLE read instead of forwarding, e.g.,
+  // "6295.5C" to Home Assistant). Capability flags tied to some of these registers
+  // (hydro/boiler/puffer presence) are independent of the value's plausibility, so
+  // they're still set below even if the reading itself gets discarded.
+  if (reg == REG_MAXPOT_IDRO){ g_caps.maxPotIdro=val; g_caps.hydro=(val!=SENTINEL16 && val>0); return; }
+  if (reg == REG_SET_BOILER) { g_caps.boiler=(val!=SENTINEL16); return; }
+  if (reg == REG_SET_PUFFER) g_caps.puffer=(val!=SENTINEL16);   // fall through: value itself handled below
+
+  { bool changed=false;
+    if (ovenApplyScaledTemp(reg, val, changed)){ if(changed) bumpSeq(); return; }
+  }
+
   switch(reg){
     // ---- Capability registers (filled once during capScan, see below) ----
-    case REG_MAXPOT_IDRO: g_caps.maxPotIdro=val; g_caps.hydro=(val!=SENTINEL16 && val>0); break;
-    case REG_SET_BOILER:  g_caps.boiler=(val!=SENTINEL16); break;
-    case REG_SET_PUFFER: { g_caps.puffer=(val!=SENTINEL16);
-        float c=(val==SENTINEL16)?NAN:val/10.0f;
-        if(g_oven.pufferSet!=c && !(isnan(g_oven.pufferSet)&&isnan(c))){ g_oven.pufferSet=c; bumpSeq(); } } break;
     case REG_TIPO_APP:    g_caps.tipoApp=val; break;
     case REG_CLIMA:       g_caps.clima=(val!=0 && val!=SENTINEL16); break;
     case REG_ABI_VEN12:   g_caps.fanCount = (uint8_t)(((val&0xFF)!=0)+((val>>8)!=0)); break;   // fan1/2
@@ -223,17 +329,6 @@ void ovenApplyReg(uint16_t reg, uint16_t val){
     case REG_VVEN1_HI:    g_caps.fanLevels += (uint8_t)(((val&0xFF)!=0)+((val>>8)!=0));         // v4..v5
                           if(g_caps.fanLevels>5) g_caps.fanLevels=5;
                           if(g_caps.fanLevels<1) g_caps.fanLevels=1; break;
-    case REG_ROOM:    { float c=val/10.0f; if(g_oven.roomC!=c)    {g_oven.roomC=c;     bumpSeq();} } break;
-    case REG_BOILER_T:{ float c=val/10.0f; if(g_oven.boilerC!=c)  {g_oven.boilerC=c;   bumpSeq();} } break;
-    case REG_PUFFER_T:{ float c=val/10.0f; if(g_oven.pufferC!=c)  {g_oven.pufferC=c;   bumpSeq();} } break;
-    case REG_HYST_AMB_NEG:{ float c=val/10.0f; if(g_oven.hystAmbNeg!=c){g_oven.hystAmbNeg=c;bumpSeq();} } break;
-    case REG_HYST_AMB_POS:{ float c=val/10.0f; if(g_oven.hystAmbPos!=c){g_oven.hystAmbPos=c;bumpSeq();} } break;
-    case REG_HYST_SS_NEG: { float c=val/10.0f; if(g_oven.hystSSNeg !=c){g_oven.hystSSNeg =c;bumpSeq();} } break;
-    case REG_HYST_SS_POS: { float c=val/10.0f; if(g_oven.hystSSPos !=c){g_oven.hystSSPos =c;bumpSeq();} } break;
-    case REG_PUMP_MIN_ON: { float c=val/10.0f; if(g_oven.pumpMinOn !=c){g_oven.pumpMinOn =c;bumpSeq();} } break;
-    case REG_BOARD:   { float c=val/10.0f; if(g_oven.boardC!=c)   {g_oven.boardC=c;    bumpSeq();} } break;
-    case REG_FUMES:   { float c=val/10.0f; if(g_oven.fumesC!=c)   {g_oven.fumesC=c;    bumpSeq();} } break;
-    case REG_SETPOINT:{ float c=val/10.0f; if(g_oven.setpointC!=c){g_oven.setpointC=c; bumpSeq();} } break;
     case REG_POWER:    if(g_oven.power !=(int8_t)val){ g_oven.power =(int8_t)val; bumpSeq(); } break;
     case REG_MODE:                                                   // setting + live mirror
     case REG_MODE_LIVE:if(g_oven.mode  !=(int8_t)val){ g_oven.mode  =(int8_t)val; bumpSeq(); } break;
@@ -256,9 +351,9 @@ void ovenApplyReg(uint16_t reg, uint16_t val){
     case REG_FAN_COMB: if(g_oven.fanComb!=(int32_t)val){g_oven.fanComb=(int32_t)val;bumpSeq();} break;
     case REG_FAN_ROOM: if(g_oven.fanRoom!=(int32_t)val){g_oven.fanRoom=(int32_t)val;bumpSeq();} break;
     case REG_FAN_LIVE: if(g_oven.fanLevel!=(int8_t)val){g_oven.fanLevel=(int8_t)val;bumpSeq();} break;
-    case REG_WORK_LO:  workLo = val; break;                          // remember low; minutes at HI
-    case REG_WORK_HI:  { int32_t m=(int32_t)((((uint32_t)val<<16)|workLo)/60);
-                         if(acceptCounter(g_oven.worktimeMin, m)) bumpSeq(); } break;
+    case REG_WORK_LO:  workLo = val; break;                          // remember low; hours at HI
+    case REG_WORK_HI:  { int32_t m=(int32_t)(((uint32_t)val<<16)|workLo);
+                         if(acceptCounter(g_oven.worktimeMinutes, m)) bumpSeq(); } break;
     default: break;
   }
 }
@@ -411,9 +506,9 @@ static void printStatus(){
     for(int k=0;k<10 && g_oven.alarmHist[k]>=0;k++) Serial.printf(" A%d", g_oven.alarmHist[k]);
     Serial.println(); }
   if (g_oven.ignitions>=0)      Serial.printf("  Ignitions        = %ld\n", (long)g_oven.ignitions);
-  if (g_oven.worktimeMin>=0)    Serial.printf("  Total work time  = %ld min\n", (long)g_oven.worktimeMin);
-  for (int i=0;i<5;i++) if (g_oven.powerTimeMin[i]>=0)
-    Serial.printf("  Time power %d     = %ld min\n", i+1, (long)g_oven.powerTimeMin[i]);
+  if (g_oven.worktimeMinutes>=0)    Serial.printf("  Total work time  = %.2f h (%ld min)\n", (double)g_oven.worktimeMinutes/60.0, (long)g_oven.worktimeMinutes);
+  for (int i=0;i<5;i++) if (g_oven.powerTimeMinutes[i]>=0)
+    Serial.printf("  Time power %d     = %.2f h (%ld min)\n", i+1, (double)g_oven.powerTimeMinutes[i]/60.0, (long)g_oven.powerTimeMinutes[i]);
 }
 
 // ---- Notify (abf2): decrypt + parse Modbus ---------------------------------
@@ -585,7 +680,19 @@ static void handleLine(String line){
   line.trim(); if(!line.length()) return; String low=line; low.toLowerCase();
   if(low=="help"){
     Serial.println("temp <c> | power <1-5> | mode <0-4> | fan <auto|1-5> | silent <on|off> | "
-                   "on | off | settime | alarms | getchrono | status | poll | scan | target <mac|none> | log <on|off> | r <regHex> <count> | w <regHex> <valHex> | wm <regHex> <v..> | ctr <hex> | help"); return; }
+                   "on | off | settime | alarms | getchrono | status | poll | scan | target <mac|none> | log <on|off> | "
+                   "pause | resume | regs [known|unknown] | r <regHex> <count> | w <regHex> <valHex> | wm <regHex> <v..> | ctr <hex> | help"); return; }
+  if(low=="pause"){                       // freeze Telnet OUTPUT only (input/typing unaffected)
+    Serial.println(">> Telnet output paused (buffering up to 4KB) - type 'resume' to continue");
+    g_telnetSerial.pauseOutput(); return; }
+  if(low=="resume"){
+    g_telnetSerial.resumeOutput();
+    Serial.println(">> Telnet output resumed");
+    uint32_t dropped = g_telnetSerial.pauseDropped();
+    if(dropped) Serial.printf("!! %u bytes were dropped while paused (buffer full)\n", (unsigned)dropped);
+    return; }
+  if(low=="regs" || low=="regs known" || low=="regs unknown"){
+    printRegTable(low=="regs known" ? 1 : low=="regs unknown" ? 2 : 0); return; }
   if(low=="poll"){ sendRead(0x02BC,0x33); return; }
   if(low=="status"){ printStatus(); return; }
   if(low=="on"){ ovenSetOnOff(true); return; }
@@ -689,16 +796,24 @@ bool bleScanListGet(int i, String& mac, String& name){
   if (i<0 || i>=g_scanCount) return false;
   mac=g_scanItems[i].mac; name=g_scanItems[i].name; return true;
 }
+// Watchdog timeout: generous margin above the worst-case single blocking stretch inside one
+// loop() iteration (e.g. 'getchrono' does up to 7 sequential bleReadRegs() @ ~1.5s each =~10.5s).
+// If loop() ever fails to come back around within this window (BLE stack wedged, infinite
+// loop, etc.) the chip resets itself instead of silently hanging until someone notices.
+static const uint32_t WDT_TIMEOUT_S = 30;
+
 void setup(){
   Serial.begin(115200); delay(300);
   Serial.println("\n=== MCZ BLE-Modbus-Controller ===");
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);   // true = panic -> reboot on timeout
+  esp_task_wdt_add(NULL);                   // watch the current (loop) task
   configLoad();               // runtime config from NVS (defaults from config.h)
   displayInstance().begin();  // display FIRST -> UI visible immediately (instead of ~8s white)
   NimBLEDevice::init(""); NimBLEDevice::setMTU(517); setupSecurity();
   g_scan=NimBLEDevice::getScan(); g_scan->setAdvertisedDeviceCallbacks(&g_scanCb);
   g_scan->setActiveScan(true); g_scan->setInterval(100); g_scan->setWindow(99);
   netBegin();                 // WiFi + MQTT (no-op with -DUSE_MQTT=0)
-  configTzTime(OVEN_TZ, "pool.ntp.org");   // NTP -> oven clock (timezone from config.h)
+  configTzTime(OVEN_TZ, "192.168.60.1");   // NTP -> oven clock (timezone from config.h)
   startScan();                // non-blocking
   for (int i=0;i<6;i++){ displayInstance().tick(); delay(15); }   // draw UI initially
 }
@@ -830,6 +945,7 @@ static void heartbeat(){
     g_connected?1:0, netWifiUp()?1:0, netMqttUp()?1:0);
 }
 void loop(){
+  esp_task_wdt_reset();      // feed the watchdog (see WDT_TIMEOUT_S above)
   g_telnetSerial.tick();     // accept/maintain the WiFi Telnet console client
   static String line;
   while(Serial.available()){ char c=(char)Serial.read();

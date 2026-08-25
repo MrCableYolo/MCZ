@@ -29,9 +29,23 @@ public:
   int peek() override;
   void flush() override;
 
+  // Freeze the WiFi Telnet output so the log stops scrolling while you type a command.
+  // The real UART is NEVER affected. While paused, output is captured into a small ring
+  // buffer (not dropped) and flushed to the Telnet client on resume, so nothing is lost
+  // unless the buffer actually overflows (pauseDropped() then reports how much).
+  void pauseOutput();
+  void resumeOutput();
+  bool outputPaused() const { return paused_; }
+  uint32_t pauseDropped() const { return pauseDropped_; }
+
 private:
   WiFiServer server{23};
   WiFiClient client;
+  bool     paused_       = false;
+  uint32_t pauseDropped_ = 0;
+  static const size_t PAUSE_BUF_SIZE = 4096;   // ~ a few seconds of typical log at this rate
+  uint8_t  pauseBuf_[PAUSE_BUF_SIZE];
+  size_t   pauseLen_ = 0;
 };
 
 extern TelnetSerial g_telnetSerial;
